@@ -54,20 +54,21 @@ var (
 const JsPullRequestRemainingBytesT = "NATS/1.0 409 Batch Completed\r\n%s: %d\r\n%s: %d\r\n\r\n"
 
 type ConsumerInfo struct {
-	Stream         string          `json:"stream_name"`
-	Name           string          `json:"name"`
-	Created        time.Time       `json:"created"`
-	Config         *ConsumerConfig `json:"config,omitempty"`
-	Delivered      SequenceInfo    `json:"delivered"`
-	AckFloor       SequenceInfo    `json:"ack_floor"`
-	NumAckPending  int             `json:"num_ack_pending"`
-	NumRedelivered int             `json:"num_redelivered"`
-	NumWaiting     int             `json:"num_waiting"`
-	NumPending     uint64          `json:"num_pending"`
-	Cluster        *ClusterInfo    `json:"cluster,omitempty"`
-	PushBound      bool            `json:"push_bound,omitempty"`
-	Paused         bool            `json:"paused,omitempty"`
-	PauseRemaining time.Duration   `json:"pause_remaining,omitempty"`
+	Stream         string                `json:"stream_name"`
+	Name           string                `json:"name"`
+	Created        time.Time             `json:"created"`
+	Config         *ConsumerConfig       `json:"config,omitempty"`
+	Delivered      SequenceInfo          `json:"delivered"`
+	AckFloor       SequenceInfo          `json:"ack_floor"`
+	NumAckPending  int                   `json:"num_ack_pending"`
+	NumRedelivered int                   `json:"num_redelivered"`
+	Redelivery     *RedeliveryAccounting `json:"redelivery,omitempty"`
+	NumWaiting     int                   `json:"num_waiting"`
+	NumPending     uint64                `json:"num_pending"`
+	Cluster        *ClusterInfo          `json:"cluster,omitempty"`
+	PushBound      bool                  `json:"push_bound,omitempty"`
+	Paused         bool                  `json:"paused,omitempty"`
+	PauseRemaining time.Duration         `json:"pause_remaining,omitempty"`
 	// TimeStamp indicates when the info was gathered
 	TimeStamp      time.Time            `json:"ts"`
 	PriorityGroups []PriorityGroupState `json:"priority_groups,omitempty"`
@@ -490,6 +491,8 @@ type consumer struct {
 	rdq               []uint64
 	rdqi              avl.SequenceSet
 	rdc               map[uint64]uint64
+	rdReason          map[uint64]redeliveryReason
+	ledger            *redeliveryLedger
 	replies           map[uint64]string
 	pendingDeliveries map[uint64]*jsPubMsg        // Messages that can be delivered after achieving quorum.
 	waitingDeliveries map[string]*waitingDelivery // (Optional) request timeout messages that need to wait for replicated deliveries first.
@@ -740,6 +743,11 @@ func checkConsumerCfg(
 	}
 	if config.Durable != _EMPTY_ && !isValidAssetName(config.Durable) {
 		return NewJSStreamInvalidConfigError(errors.New("consumer durable name can not contain '.', '*', '>', '\\', '/'"))
+	}
+
+	// Redelivery accounting fields must align with existing consumer semantics.
+	if err := checkRedeliveryAccountingConfig(config); err != nil {
+		return err
 	}
 
 	// Check if replicas is defined but exceeds parent stream.
@@ -1239,6 +1247,7 @@ func (mset *stream) addConsumerWithAssignmentAndMode(config *ConsumerConfig, ona
 		retention: cfg.Retention,
 		created:   time.Now().UTC(),
 		restoring: restoring,
+		ledger:    newRedeliveryLedger(config.MaxDeliver),
 	}
 
 	// Add created timestamp used for the store, must match that of the consumer assignment if it exists.
@@ -1720,6 +1729,7 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 	// Make sure to clear out any re-deliver queues
 	o.stopAndClearPtmr()
 	o.rdc = nil
+	o.rdReason = nil
 	o.rdq = nil
 	o.rdqi.Empty()
 	o.pending = nil
@@ -1806,6 +1816,15 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 			o.readStoredState()
 		} else if o.node != nil && o.sseq >= 1 {
 			o.updateSkipped(o.sseq)
+		}
+
+		// Rebuild redelivery accounting from recovered state so that a full
+		// consumer outage does not lose messages or delivery limits. Any
+		// failure is recorded and surfaced through ConsumerInfo and the log.
+		if o.store != nil && o.store.HasState() {
+			if rerr := o.recoverRedeliveryLedger(); rerr != nil {
+				o.srv.Errorf("JetStream consumer '%s > %s > %s' %v", o.acc.Name, o.stream, o.name, rerr)
+			}
 		}
 
 		// Setup initial num pending.
@@ -3257,6 +3276,9 @@ func (o *consumer) processNak(sseq, dseq, dc uint64, nak []byte) {
 		return
 	}
 
+	// Account this as a NAK-triggered redelivery.
+	o.markRedeliveryReason(sseq, redeliveryReasonNak)
+
 	// Deliver an advisory
 	e := JSConsumerDeliveryNakAdvisory{
 		TypedEvent: TypedEvent{
@@ -3596,6 +3618,7 @@ func (o *consumer) infoWithSnapAndReply(snap bool, reply string) *ConsumerInfo {
 		},
 		NumAckPending:  len(o.pending),
 		NumRedelivered: len(o.rdc),
+		Redelivery:     o.redeliveryAccounting(),
 		NumPending:     np,
 		PushBound:      o.isPushMode() && o.active,
 		TimeStamp:      time.Now().UTC(),
@@ -5821,6 +5844,9 @@ func (o *consumer) deliverMsg(dsubj, ackReply string, pmsg *jsPubMsg, dc uint64,
 	// Update delivered first.
 	o.updateDelivered(dseq, seq, dc, ts)
 
+	// Account this delivery attempt against the redelivery ledger.
+	o.recordDeliveryAccounting(seq, dc)
+
 	if ap == AckNone {
 		o.adflr = dseq
 		o.asflr = seq
@@ -6195,6 +6221,13 @@ func (o *consumer) checkPending() {
 	if len(expired) > 0 {
 		// We need to sort.
 		slices.Sort(expired)
+		// Account these as ack-timeout redeliveries unless another trigger
+		// (e.g. a delayed NAK) was already recorded for the sequence.
+		for _, seq := range expired {
+			if _, ok := o.rdReason[seq]; !ok {
+				o.markRedeliveryReason(seq, redeliveryReasonTimeout)
+			}
+		}
 		o.addToRedeliverQueue(expired...)
 		// Now we should update the timestamp here since we are redelivering.
 		// We will use an incrementing time to preserve order for any other redelivery.
